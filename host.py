@@ -11,6 +11,8 @@ import concurrent.futures
 import hashlib
 import json
 import logging
+import os
+import tempfile
 import threading
 import time
 import uuid
@@ -53,6 +55,9 @@ class SessionRequest:
     max_output_tokens: int | None = None
     env: dict | None = None        # child env, built on the caller's thread (profile-scoped settings)
     settings: dict = field(default_factory=dict)
+    one_shot: bool = False
+    output_format: dict | None = None
+    timeout: float | None = None
 
 
 @dataclass
@@ -131,6 +136,7 @@ class SessionHost:
         self._thread: threading.Thread | None = None
         self._started = threading.Lock()
         self._launch_lock = asyncio.Lock()
+        self._one_shot_slots = asyncio.Semaphore(2)
         self._sdk: Any = None
 
     # -- loop thread -------------------------------------------------------------------------
@@ -155,11 +161,13 @@ class SessionHost:
         return asyncio.run_coroutine_threadsafe(coro, self._ensure_loop())
 
     def interrupt(self, home: str, session_id: str) -> None:
-        entry = self._entries.get((home, session_id))
-        if entry is None or self._loop is None:
+        if self._loop is None:
             return
 
         def stop() -> None:
+            entry = self._entries.get((home, session_id))
+            if entry is None:
+                return
             entry.cancelled = True
             entry.cancel_event.set()
             if entry.live is not None:
@@ -202,13 +210,19 @@ class SessionHost:
                 entry.idle.cancel()
                 entry.idle = None
             try:
+                if req.timeout is not None:
+                    return await asyncio.wait_for(self._run_cancellable(entry, req, emit), req.timeout)
                 return await self._run_cancellable(entry, req, emit)
             finally:
                 entry.busy = False
                 entry.last_used = self._clock()
                 if entry.live is None:
                     self._release(entry)
-                self._arm_idle(entry)
+                if req.one_shot:
+                    await self._close(entry, force=True)
+                    self._entries.pop((req.home, req.session_id), None)
+                else:
+                    self._arm_idle(entry)
 
     async def _run_cancellable(self, entry: _Entry, req: SessionRequest, emit) -> TurnOutcome:
         task = asyncio.create_task(self._run_locked(entry, req, emit))
@@ -223,20 +237,26 @@ class SessionHost:
                 task.cancel()
                 await asyncio.gather(task, return_exceptions=True)
                 await self._close(entry, force=True)
-                store = RecordStore(_root(req.home) / "records")
-                record = store.load(req.session_id)
-                if record is not None:
-                    record.interrupted = True
-                    store.save(req.session_id, record)
+                if not req.one_shot:
+                    store = RecordStore(_root(req.home) / "records")
+                    record = store.load(req.session_id)
+                    if record is not None:
+                        record.interrupted = True
+                        store.save(req.session_id, record)
             else:
                 # Retrieve the native cancellation/error so no task exception is left unobserved.
                 await asyncio.gather(task, return_exceptions=True)
             raise RuntimeError(errors.CANCELLED)
         finally:
+            if not task.done():
+                task.cancel()
             cancelled.cancel()
-            await asyncio.gather(cancelled, return_exceptions=True)
+            await asyncio.gather(task, cancelled, return_exceptions=True)
 
     async def _run_locked(self, entry: _Entry, req: SessionRequest, emit) -> TurnOutcome:
+        if req.one_shot:
+            async with self._one_shot_slots:
+                return await self._run_one_shot(entry, req, emit)
         store = RecordStore(_root(req.home) / "records")
         if entry.lease is None:
             try:
@@ -429,6 +449,62 @@ class SessionHost:
         record.history = rebuild_checkpoints(g, record.history, new_ids)
         store.save(req.session_id, record)
         raise errors.from_step(end, live.stderr_tail)
+
+    async def _run_one_shot(self, entry: _Entry, req: SessionRequest, emit) -> TurnOutcome:
+        try:
+            from .convert import one_off_blocks
+        except ImportError:
+            from convert import one_off_blocks
+        import jsonschema
+
+        blocks = one_off_blocks(req.messages)
+        env = dict(self._env_override if self._env_override is not None else req.env or child_env())
+        cli = self._cli_path or resolve_claude(env)
+        if cli is None:
+            raise errors.ClaudeCodeMissing(errors.INSTALL_HINT)
+        sdk = self._load_sdk()
+        with tempfile.TemporaryDirectory(prefix="claude-agent-oneoff-", dir=os.environ.get("TMPDIR")) as temp:
+            cwd = Path(temp)
+            pending = PendingTools()
+            options = build_options(
+                sdk=sdk, cli_path=cli, cwd=cwd, model=req.model, effort=req.effort,
+                thinking_disabled=req.thinking_disabled, system_prompt_file=write_private(cwd / "system.md", req.system),
+                mcp_server=make_mcp_server(req.tools, pending, sdk), hooks=make_hooks(pending, sdk), env=env,
+                session_id=str(uuid.uuid4()), output_format=req.output_format, one_shot=True)
+            live = LiveSession(sdk=sdk, options=options, offered=openai_tool_names(req.tools), pending=pending,
+                               model=req.model, effort=req.effort)
+            options.stderr = live.on_stderr
+            entry.live = live
+            try:
+                await live.start()
+                await live.send_user(blocks, uuid=str(uuid.uuid4()))
+                end = await live.step((lambda *_: None) if req.output_format else emit,
+                                      timeout=_int(req.settings, "step_timeout_seconds", 900))
+                if end.kind == "interrupted":
+                    raise RuntimeError(errors.CANCELLED)
+                if end.kind == "error":
+                    raise errors.from_step(end, live.stderr_tail)
+                if req.output_format is not None:
+                    if end.kind != "stop" or end.structured_output is None:
+                        raise errors.ClaudeAPIError("Claude returned no complete structured output", 502)
+                    try:
+                        jsonschema.Draft202012Validator(req.output_format["schema"]).validate(end.structured_output)
+                    except jsonschema.ValidationError as error:
+                        raise errors.ClaudeAPIError("Claude structured output did not match the requested schema", 502) from error
+                    end.text = json.dumps(end.structured_output, ensure_ascii=False, separators=(",", ":"))
+                    emit("text", end.text)
+                return TurnOutcome(end, reply_message(end))
+            except (errors.ClaudeAPIError, errors.ClaudeCodeMissing, errors.ClaudeCodeLoggedOut, ValueError,
+                    asyncio.TimeoutError):
+                raise
+            except RuntimeError as error:
+                if str(error) == errors.CANCELLED:
+                    raise
+                raise errors.ClaudeAPIError("Claude one-off process failed", 503) from error
+            except Exception as error:
+                raise errors.ClaudeAPIError("Claude one-off process failed", 503) from error
+            finally:
+                await self._close(entry, force=True)
 
     # -- processes ---------------------------------------------------------------------------
     def _load_sdk(self):

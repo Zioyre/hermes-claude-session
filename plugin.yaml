@@ -1,6 +1,6 @@
 name: claude-agent-session-experimental
 kind: model-provider
-version: 0.1.0
+version: 0.2.0
 manifest_version: 2
 description: Persistent Claude Code sessions through the Agent SDK, with Hermes-owned tools and compaction.
 author: hermes-claude-session contributors
@@ -11,7 +11,6 @@ requires_hermes: ">=0.21.4"
 platforms: [linux, macos]
 optional_env:
   - CLAUDE_AGENT_SESSION_COMMAND
-  - CLAUDE_AGENT_SESSION_DIRECTSDK_DIR
 external_dependencies:
   - name: claude
     check: "claude --version"

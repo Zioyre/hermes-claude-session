@@ -10,6 +10,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+try:
+    from .catalog import supports_adaptive_thinking
+except ImportError:
+    from catalog import supports_adaptive_thinking
+
 PLUGIN_ID = "claude-agent-session-experimental"
 
 # Claude Code features that duplicate Hermes's own; Hermes's version wins.
@@ -150,9 +155,12 @@ def write_private(path: Path, text: str) -> Path:
 def build_options(*, sdk: Any, cli_path: str, cwd: Path, model: str, effort: str | None, thinking_disabled: bool,
                   system_prompt_file: Path, mcp_server: Any, hooks: dict, env: dict[str, str],
                   resume: str | None = None, session_id: str | None = None,
-                  stderr: Callable[[str], None] | None = None) -> Any:
+                  stderr: Callable[[str], None] | None = None, output_format: dict | None = None,
+                  one_shot: bool = False) -> Any:
     """ClaudeAgentOptions with every native feature off except the Hermes MCP tools."""
     thinking = {"type": "disabled"} if thinking_disabled else {"type": "adaptive", "display": "summarized"}
+    if not thinking_disabled and not supports_adaptive_thinking(model):
+        thinking = None
     kwargs: dict[str, Any] = dict(
         cli_path=cli_path, cwd=str(cwd), model=model, env=env, tools=[], setting_sources=[],
         strict_mcp_config=True, skills=[],
@@ -161,6 +169,11 @@ def build_options(*, sdk: Any, cli_path: str, cwd: Path, model: str, effort: str
         system_prompt={"type": "file", "path": str(system_prompt_file)},
         extra_args={"debug-to-stderr": None}, stderr=stderr,
     )
+    if output_format is not None:
+        kwargs["output_format"] = output_format
+    if one_shot:
+        kwargs["extra_args"]["no-session-persistence"] = None
+        kwargs["max_turns"] = 3 if output_format else 1
     if effort and not thinking_disabled:
         kwargs["effort"] = effort
     if resume:

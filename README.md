@@ -8,7 +8,6 @@ Provider ID: `claude-agent-session-experimental`.
 
 - Hermes Agent 0.21.4 or newer with `ProviderProfile.create_client()` and `build_api_kwargs_extras()` support.
 - The official Claude Code CLI, installed and logged in with `claude auth login`.
-- [Claude Subscription DirectSDK](https://github.com/NousResearch/hermes-official-plugins/tree/main/claude-subscription-directsdk) installed in the same Hermes profile. This plugin uses its model catalog and sends auxiliary requests through it.
 - Python packages supplied by Hermes: `anyio>=4.0.0`, `jsonschema>=4.20.0`, `mcp>=1.23.0,<3`, and `sniffio>=1.0.0`. Python 3.10 also needs `typing-extensions>=4.0.0`. These must be available to Hermes's runtime interpreter.
 - Linux. Unix file locking is required; native Windows is unsupported. macOS is declared in the manifest but has not been qualified.
 
@@ -21,7 +20,6 @@ Subscription access, usage limits, and billing follow Anthropic's current plan r
 Run these commands for the Hermes profile that will use the provider:
 
 ```sh
-hermes plugins install claude-subscription-directsdk
 hermes plugins install Zioyre/hermes-claude-session
 claude auth login
 ```
@@ -34,7 +32,7 @@ Select **Claude Agent Session (Experimental)** in the model picker, or run:
 hermes chat --provider claude-agent-session-experimental --model sonnet
 ```
 
-Select `claude-subscription-directsdk-experimental` to return to the stateless provider. Neither provider changes the Hermes conversation database format.
+No other provider plugin is required. This plugin owns its model catalog, CLI login checks, model discovery, account usage reporting, and one-off SDK requests. It does not change the Hermes conversation database format.
 
 ## Settings
 
@@ -53,16 +51,16 @@ plugins:
         claude_code_telemetry: true
 ```
 
-- `max_live_processes` limits native processes per Hermes process. Idle sessions are stopped first, then sessions waiting for tool results. If every slot is generating, new sessions receive a retryable capacity error. Auxiliary DirectSDK processes are outside this cap.
+- `max_live_processes` limits native processes per Hermes process. Idle sessions are stopped first, then sessions waiting for tool results. If every slot is generating, new sessions receive a retryable capacity error. Disposable auxiliary processes are outside this cap and limited to two concurrent calls per Hermes process.
 - `idle_seconds` stops a process after a finished turn. The next request resumes its transcript.
 - `parked_idle_seconds` stops a turn waiting for Hermes tool results. Missing conversation is restored as a text checkpoint when needed.
 - `step_timeout_seconds` limits the wait between native protocol messages, not the total duration of a streaming response.
 - `claude_config_dir` selects the Claude Code login directory. An empty value uses inherited `CLAUDE_CONFIG_DIR` or the CLI default.
 - `claude_code_telemetry: false` disables nonessential native traffic. The default preserves Claude Code's normal feature-flag behavior.
 
-`CLAUDE_AGENT_SESSION_COMMAND` selects an executable path. `CLAUDE_AGENT_SESSION_DIRECTSDK_DIR` selects the directory containing DirectSDK's `model_catalog.py`; it does not install or register that dependency.
+`CLAUDE_AGENT_SESSION_COMMAND` selects an executable path. Model discovery uses the CLI's initialization response without an inference request. Login checks use `claude auth status`; plan usage comes from the native `get_usage` control request. Credential files are never read by this plugin.
 
-Native session processes use `CLAUDE_CODE_ENTRYPOINT=glibglorper`, replacing inherited values. This is a client attribution label, not a guarantee about usage limits or billing. Auxiliary DirectSDK calls are unchanged.
+Native session processes use `CLAUDE_CODE_ENTRYPOINT=glibglorper`, replacing inherited values. This is a client attribution label, not a guarantee about usage limits or billing. The same label applies to disposable SDK calls.
 
 ## How it works
 
@@ -75,8 +73,11 @@ At a native tool-call boundary, the plugin returns tool calls to Hermes and keep
 - Changes to the system prompt, tools, output limit, login directory, or thinking-disable mode restart the process and resume the transcript.
 - Hermes compaction markers start a fresh native session. Rewinds fork at a clean checkpoint; missing history becomes text in `<conversation-checkpoint>`.
 - Earlier message edits with an unchanged later checkpoint are logged but not applied to the native transcript. The model retains the older version until a fresh native session starts.
-- Auxiliary tasks, requests without a Hermes session ID, iteration-limit summaries, structured output, forced tool selection, and multiple-choice requests go through DirectSDK.
-- Cancellation gives native interruption one second to complete, then kills an unresponsive child. Hermes owns retries; the native request counter observes extra requests but does not enforce DirectSDK's single-request admission boundary.
+- Auxiliary tasks, requests without a Hermes session ID, iteration-limit summaries, and JSON-schema requests use disposable SDK sessions. They do not write conversation checkpoints or disturb a parked main session.
+- One-off history is represented as role-marked text with base64 image blocks retained, not signed native history. Unsupported content types and remote image URLs fail explicitly.
+- Native structured results are validated against the caller's original JSON schema. Schema requests allow up to three native turns; ordinary one-off requests allow one. Neither is a strict upstream HTTP request cap.
+- Multiple choices, forced tool selection, `parallel_tool_calls=False`, JSON-object-only mode, and nonempty stop sequences are unsupported and rejected before an auxiliary process starts. Sampling defaults are accepted but not forwarded.
+- Cancellation gives native interruption one second to complete, then kills an unresponsive child. Hermes owns retries; the native request counter observes extra requests but does not enforce a single-request HTTP admission boundary.
 
 ## State and privacy
 
@@ -91,7 +92,7 @@ Claude Code also stores native transcripts in its configuration directory. Delet
 
 ## Status and limits
 
-This is experimental software, not a production-readiness claim. Prior Linux testing exercised Hermes tools, steering, interruption, and native session resume with Claude Code 2.1.314 and Python 3.14. Other versions and platforms need qualification.
+This is experimental software, not a production-readiness claim. Linux testing exercised Hermes tools, steering, interruption, and native session resume with Claude Code 2.1.314 and Python 3.14. The standalone implementation also passed real login, model-picker, plan-usage, and JSON-schema completion checks on that CLI. The small schema check observed one native inference request and left no disposable host entry. Other versions and platforms need qualification.
 
 - Live manual compaction and switching between model families remain unqualified. Offline protocol tests cover compaction-to-fresh-session behavior.
 - Catch-up history is text, not a lossless replay of reasoning or old images.

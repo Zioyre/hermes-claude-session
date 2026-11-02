@@ -58,6 +58,7 @@ class StepEnd:
     result: Any = None
     upstream_requests: int = 0
     native_error: str | None = None   # AssistantMessage.error code (rate_limit, billing_error, ...)
+    structured_output: Any = None
 
 
 class LiveSession:
@@ -213,6 +214,7 @@ class LiveSession:
             if isinstance(item, sdk.ResultMessage):
                 self.in_turn = False
                 end.result = item
+                end.structured_output = getattr(item, "structured_output", None)
                 self.session_id = item.session_id or self.session_id
                 if self._interrupting:
                     end.kind = "interrupted"
