@@ -100,6 +100,7 @@ def build_request(kwargs: dict, *, one_shot: bool = False) -> SessionRequest:
     max_tokens = kwargs.get("max_tokens") or kwargs.get("max_completion_tokens") or extra.get("max_tokens")
     max_tokens = max_tokens if isinstance(max_tokens, int) and max_tokens > 0 else None
     messages = list(kwargs.get("messages") or [])
+    response_format = kwargs.get("response_format") or extra.get("response_format") or {}
     timeout = kwargs.get("timeout", 900)
     if timeout is not None and not isinstance(timeout, (int, float)):
         timeout = getattr(timeout, "read", 900)
@@ -111,6 +112,7 @@ def build_request(kwargs: dict, *, one_shot: bool = False) -> SessionRequest:
         env=child_env(max_output_tokens=max_tokens),
         settings={k: v for k in SETTINGS if (v := setting(k)) is not None},
         one_shot=one_shot, output_format=structured_format(kwargs) if one_shot else None,
+        json_mode=one_shot and response_format.get("type") == "json_object",
         timeout=timeout if one_shot else None)
 
 
@@ -264,6 +266,6 @@ class Client:
             host().interrupt(home, session_id)
 
     def close(self) -> None:
-        """Hermes recycles clients freely; live sessions belong to the host, not to this object."""
+        """Cancel owned disposable calls; persistent sessions remain owned by the host."""
         for home, session_id in list(self._one_shots):
             host().interrupt(home, session_id)

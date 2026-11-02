@@ -2,7 +2,7 @@
 
 Hermes hands the client OpenAI-shaped ``chat.completions.create`` kwargs. A disposable SDK
 call only accepts a narrow slice of that surface: one choice, automatic tool choice, no
-stop sequences and a single JSON-Schema ``response_format``. Everything else is rejected
+stop sequences, and text, JSON-object or JSON-Schema output. Everything else is rejected
 *before* a Claude Code child process starts, so a caller gets a clear error instead of a
 silently altered request.
 
@@ -12,6 +12,7 @@ Accepted-but-dropped controls (deliberate, not accidental):
 - ``stop`` / ``extra_body.stop_sequences``: only an empty value is accepted, and nothing is
   forwarded (a nonempty stop list cannot be honoured by the SDK path).
 - ``timeout``: validated here; mapping it to the SDK's own timeout belongs to the caller.
+- ``extra_body.metadata.auth_profile``: host-local routing metadata, never sent to Claude Code.
 - ``hermes_auxiliary`` / ``hermes_session_id``: host-local routing kwargs; accepted but never
   forwarded to the SDK request.
 
@@ -34,7 +35,7 @@ ALLOWED_KWARGS = frozenset({
     "response_format", "hermes_auxiliary", "hermes_session_id",
 })
 ALLOWED_EXTRA_BODY = frozenset({
-    "max_tokens", "temperature", "top_p", "stop_sequences", "reasoning", "response_format",
+    "max_tokens", "temperature", "top_p", "stop_sequences", "reasoning", "response_format", "metadata",
 })
 _STREAM_OPTIONS = (None, {}, {"include_usage": True}, {"include_usage": False})
 
@@ -134,7 +135,7 @@ def _validate_response_format(response_format: object) -> None:
     if not isinstance(response_format, dict):
         raise _error("response_format must be an object")
     kind = response_format.get("type")
-    if kind in (None, "text"):
+    if kind in (None, "text", "json_object"):
         return
     if kind != "json_schema":
         raise _error(f"response_format type {kind!r} is unsupported; only json_schema is accepted")
@@ -179,6 +180,10 @@ def validate_oneoff(kwargs: dict) -> None:
     if unknown_extra:
         raise _error("unsupported extra_body fields: " + ", ".join(sorted(unknown_extra)))
 
+    metadata = extra.get("metadata")
+    if metadata is not None and (not isinstance(metadata, dict) or set(metadata) - {"auth_profile"}
+                                 or ("auth_profile" in metadata and not isinstance(metadata["auth_profile"], str))):
+        raise _error("metadata supports host auth_profile routing only")
     _validate_reasoning(extra.get("reasoning"))
 
     top_max = kwargs.get("max_tokens")
@@ -213,7 +218,7 @@ def validate_oneoff(kwargs: dict) -> None:
 def structured_format(kwargs: dict) -> dict | None:
     """Map OpenAI ``response_format`` to the SDK ``output_format``; keep the caller's schema intact.
 
-    Returns ``None`` for an absent/text format. The returned schema is a deep copy of the
+    Returns ``None`` for absent/text/prompt-guided JSON-object formats. The schema is a deep copy of the
     caller's schema, so later validation of ``structured_output`` uses the original contract.
     """
     response_format = _response_format(kwargs)
@@ -221,7 +226,7 @@ def structured_format(kwargs: dict) -> dict | None:
         return None
     if not isinstance(response_format, dict):
         raise _error("response_format must be an object")
-    if response_format.get("type") in (None, "text"):
+    if response_format.get("type") in (None, "text", "json_object"):
         return None
     if response_format.get("type") != "json_schema":
         raise _error("only json_schema structured output is supported")

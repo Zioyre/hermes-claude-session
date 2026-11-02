@@ -83,7 +83,6 @@ def test_parallel_tool_calls_false_is_rejected():
 
 
 @pytest.mark.parametrize("response_format", [
-    {"type": "json_object"},
     {"type": "audio"},
     {},
     "text",
@@ -94,6 +93,13 @@ def test_non_json_schema_response_formats_are_rejected(response_format):
         assert validate_oneoff(base(response_format=response_format)) is None
     else:
         rejects(base(response_format=response_format), "response_format")
+
+
+def test_json_object_mode_and_host_metadata_are_accepted():
+    assert validate_oneoff(base(response_format={"type": "json_object"})) is None
+    assert structured_format(base(response_format={"type": "json_object"})) is None
+    assert validate_oneoff(base(extra_body={"metadata": {"auth_profile": "account"}})) is None
+    rejects(base(extra_body={"metadata": {"api_key": "secret"}}), "host auth_profile")
 
 
 def test_json_schema_response_format_is_accepted_top_level_and_in_extra_body():
@@ -236,7 +242,7 @@ def test_structured_format_reads_extra_body_and_returns_none_for_text_or_absent(
 
 def test_structured_format_rejects_unsupported_formats_and_invalid_schema():
     with pytest.raises(ValueError, match="only json_schema"):
-        structured_format(base(response_format={"type": "json_object"}))
+        structured_format(base(response_format={"type": "audio"}))
     with pytest.raises(ValueError, match="not valid JSON Schema"):
         structured_format(base(response_format={"type": "json_schema",
                                                 "json_schema": {"schema": {"type": "nope"}}}))

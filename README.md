@@ -76,7 +76,9 @@ At a native tool-call boundary, the plugin returns tool calls to Hermes and keep
 - Auxiliary tasks, requests without a Hermes session ID, iteration-limit summaries, and JSON-schema requests use disposable SDK sessions. They do not write conversation checkpoints or disturb a parked main session.
 - One-off history is represented as role-marked text with base64 image blocks retained, not signed native history. Unsupported content types and remote image URLs fail explicitly.
 - Native structured results are validated against the caller's original JSON schema. Schema requests allow up to three native turns; ordinary one-off requests allow one. Neither is a strict upstream HTTP request cap.
-- Multiple choices, forced tool selection, `parallel_tool_calls=False`, JSON-object-only mode, and nonempty stop sequences are unsupported and rejected before an auxiliary process starts. Sampling defaults are accepted but not forwarded.
+- JSON-object mode is prompt-guided, then parsed and checked locally before returning any text. It does not use native schema enforcement.
+- Multiple choices, forced tool selection, `parallel_tool_calls=False`, and nonempty stop sequences are unsupported and rejected before an auxiliary process starts. Sampling defaults are accepted but not forwarded.
+- Host `metadata.auth_profile` is accepted as routing metadata and not sent to Claude Code. It does not select a different native login; use `claude_config_dir` for that.
 - Cancellation gives native interruption one second to complete, then kills an unresponsive child. Hermes owns retries; the native request counter observes extra requests but does not enforce a single-request HTTP admission boundary.
 
 ## State and privacy

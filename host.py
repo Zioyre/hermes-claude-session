@@ -57,6 +57,7 @@ class SessionRequest:
     settings: dict = field(default_factory=dict)
     one_shot: bool = False
     output_format: dict | None = None
+    json_mode: bool = False
     timeout: float | None = None
 
 
@@ -463,12 +464,15 @@ class SessionHost:
         if cli is None:
             raise errors.ClaudeCodeMissing(errors.INSTALL_HINT)
         sdk = self._load_sdk()
+        system = req.system
+        if req.json_mode:
+            system += "\nReturn a single valid JSON object. Do not include Markdown fences or explanatory text."
         with tempfile.TemporaryDirectory(prefix="claude-agent-oneoff-", dir=os.environ.get("TMPDIR")) as temp:
             cwd = Path(temp)
             pending = PendingTools()
             options = build_options(
                 sdk=sdk, cli_path=cli, cwd=cwd, model=req.model, effort=req.effort,
-                thinking_disabled=req.thinking_disabled, system_prompt_file=write_private(cwd / "system.md", req.system),
+                thinking_disabled=req.thinking_disabled, system_prompt_file=write_private(cwd / "system.md", system),
                 mcp_server=make_mcp_server(req.tools, pending, sdk), hooks=make_hooks(pending, sdk), env=env,
                 session_id=str(uuid.uuid4()), output_format=req.output_format, one_shot=True)
             live = LiveSession(sdk=sdk, options=options, offered=openai_tool_names(req.tools), pending=pending,
@@ -478,13 +482,22 @@ class SessionHost:
             try:
                 await live.start()
                 await live.send_user(blocks, uuid=str(uuid.uuid4()))
-                end = await live.step((lambda *_: None) if req.output_format else emit,
+                end = await live.step((lambda *_: None) if req.output_format or req.json_mode else emit,
                                       timeout=_int(req.settings, "step_timeout_seconds", 900))
                 if end.kind == "interrupted":
                     raise RuntimeError(errors.CANCELLED)
                 if end.kind == "error":
                     raise errors.from_step(end, live.stderr_tail)
-                if req.output_format is not None:
+                if req.json_mode:
+                    try:
+                        value = json.loads(end.text)
+                    except ValueError as error:
+                        raise errors.ClaudeAPIError("Claude returned invalid JSON in JSON-object mode", 502) from error
+                    if end.kind != "stop" or not isinstance(value, dict):
+                        raise errors.ClaudeAPIError("Claude returned no complete JSON object", 502)
+                    end.text = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+                    emit("text", end.text)
+                elif req.output_format is not None:
                     if end.kind != "stop" or end.structured_output is None:
                         raise errors.ClaudeAPIError("Claude returned no complete structured output", 502)
                     try:
@@ -576,7 +589,8 @@ class SessionHost:
 
     async def _evict_for_room(self, current: _Entry) -> None:
         limit = max(1, _int(current.settings, "max_live_processes", 2))
-        live = [e for e in self._entries.values() if e.live is not None and e is not current]
+        live = [e for e in self._entries.values()
+                if e.live is not None and e is not current and e.lease is not None]
         while len(live) >= limit:
             idle = [e for e in live if not e.busy and not e.lock.locked()]
             if not idle:

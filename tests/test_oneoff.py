@@ -156,3 +156,46 @@ def test_auxiliary_does_not_touch_parked_main_session(tmp_path, run):
                          {"role": "tool", "tool_call_id": call.id, "content": "ok"}]
     final = c.chat.completions.create(**main)
     assert final.choices[0].message.content.strip() == "done"
+
+
+def test_auxiliary_processes_do_not_use_persistent_capacity(tmp_path, run):
+    host = run([[{"blocks": [{"text": "one two three four five six"}], "slow": 0.25}]])
+    c = client.Client()
+    first = c.chat.completions.create(**request(stream=True))
+    second = c.chat.completions.create(**request(stream=True))
+    assert next(first).choices[0].delta.content
+    assert next(second).choices[0].delta.content
+    assert sum(entry.live is not None for entry in host._entries.values()) == 2
+    (tmp_path / "script.json").write_text(json.dumps([[{"blocks": [{"text": "main reply"}]}]]))
+    response = c.chat.completions.create(**request(hermes_session_id="main"))
+    assert response.choices[0].message.content.strip() == "main reply"
+    assert list(first)[-1].choices[0].finish_reason == "stop"
+    assert list(second)[-1].choices[0].finish_reason == "stop"
+
+
+def test_host_auth_profile_metadata_is_not_sent_to_native(tmp_path, run):
+    host = run([[{"blocks": [{"text": "summary"}]}]])
+    response = client.Client().chat.completions.create(
+        **request(extra_body={"metadata": {"auth_profile": "routing-only"}}))
+    assert response.choices[0].message.content.strip() == "summary"
+    assert "routing-only" not in json.dumps(fake_log(tmp_path))
+    assert_disposed(tmp_path, host)
+
+
+def test_json_object_mode_uses_validated_text_without_native_schema(tmp_path, run):
+    host = run([[{"blocks": [{"text": '{"ok":true}'}]}]])
+    stream = client.Client().chat.completions.create(
+        **request(stream=True, response_format={"type": "json_object"}))
+    chunks = list(stream)
+    assert json.loads("".join(c.choices[0].delta.content or "" for c in chunks)) == {"ok": True}
+    assert "--json-schema" not in fake_log(tmp_path)[0]["argv"]
+    assert_disposed(tmp_path, host)
+
+
+@pytest.mark.parametrize("text", ["not json", "[]"])
+def test_json_object_mode_rejects_non_object_results(tmp_path, run, text):
+    host = run([[{"blocks": [{"text": text}]}]])
+    with pytest.raises(errors.ClaudeAPIError) as caught:
+        client.Client().chat.completions.create(**request(response_format={"type": "json_object"}))
+    assert caught.value.status_code == 502
+    assert_disposed(tmp_path, host)
