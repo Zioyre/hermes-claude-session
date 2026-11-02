@@ -88,7 +88,7 @@ def test_async_caller_gets_async_stream(fake_host):
 ])
 def test_routing(extra, expected):
     base = {"model": "haiku", "messages": [], "hermes_session_id": "s"}
-    assert client_module.wants_directsdk({**base, **extra}) is expected
+    assert client_module.wants_oneoff({**base, **extra}) is expected
 
 
 def test_reasoning_mapping(monkeypatch, tmp_path):

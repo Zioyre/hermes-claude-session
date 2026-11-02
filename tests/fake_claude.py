@@ -41,7 +41,8 @@ def arg(name):
 
 SESSION = arg("--resume") or arg("--session-id") or str(uuid.uuid4())
 if LOG:
-    LOG.write(json.dumps({"argv": ARGV, "entrypoint": os.environ.get("CLAUDE_CODE_ENTRYPOINT")}) + "\n")
+    LOG.write(json.dumps({"argv": ARGV, "entrypoint": os.environ.get("CLAUDE_CODE_ENTRYPOINT"),
+                          "pid": os.getpid(), "cwd": os.getcwd()}) + "\n")
 
 
 def send(obj):
@@ -147,10 +148,13 @@ def assistant(mid, block):
           "parent_tool_use_id": None, "session_id": SESSION, "uuid": str(uuid.uuid4())})
 
 
-def result(subtype="success", is_error=False, text="", num_turns=1, api_error_status=None, stop_reason="end_turn"):
+def result(subtype="success", is_error=False, text="", num_turns=1, api_error_status=None, stop_reason="end_turn",
+           structured_output=None):
     payload = {"type": "result", "subtype": subtype, "is_error": is_error, "duration_ms": 10,
                "duration_api_ms": 10, "num_turns": num_turns, "result": text, "stop_reason": stop_reason,
                "session_id": SESSION, "total_cost_usd": 0.0, "usage": usage(), "uuid": str(uuid.uuid4())}
+    if structured_output is not None:
+        payload["structured_output"] = structured_output
     if api_error_status:
         payload["api_error_status"] = api_error_status
         payload["errors"] = [f"API Error: {api_error_status}"]
@@ -249,7 +253,7 @@ def run_turn(turn, steer_box):
             service_inbox(steer_box)
         if not calls:
             result("success", False, text=" ".join(texts), num_turns=n,
-                   stop_reason=call.get("stop_reason") or "end_turn")
+                   stop_reason=call.get("stop_reason") or "end_turn", structured_output=call.get("structured_output"))
             return
     result("success", False, text=" ".join(texts), num_turns=len(turn))
 

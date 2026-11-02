@@ -131,13 +131,13 @@ def test_missing_fork_binding_is_discarded_for_retry(tmp_path):
     assert store.load("s1") is None
 
 
-def test_iteration_limit_summary_routes_to_directsdk():
+def test_iteration_limit_summary_uses_disposable_session():
     from agent.context_compressor import MAX_ITERATIONS_SUMMARY_REQUEST
 
     import client
     kwargs = {"hermes_session_id": "s", "tools": [{"type": "function"}],
               "messages": [{"role": "user", "content": MAX_ITERATIONS_SUMMARY_REQUEST}]}
-    assert client.wants_directsdk(kwargs)
+    assert client.wants_oneoff(kwargs)
 
 
 async def test_failed_disconnect_kills_and_reaps_native_child():

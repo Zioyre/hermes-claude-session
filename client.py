@@ -1,30 +1,29 @@
-"""OpenAI-shaped client Hermes calls once per model step; routes to the session host or to DirectSDK."""
+"""OpenAI-shaped completions over persistent and disposable Claude Agent SDK sessions."""
 from __future__ import annotations
 
 import asyncio
 import copy
-import importlib.util
 import inspect
-import logging
 import os
 import queue
 import sys
 import threading
+import uuid
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
 try:
-    from . import errors
+    from . import catalog as CATALOG
     from .host import SessionHost, SessionRequest
     from .options import child_env, clamp_effort, setting
+    from .params import structured_format, validate_oneoff
 except ImportError:
-    import errors
+    import catalog as CATALOG
     from host import SessionHost, SessionRequest
     from options import child_env, clamp_effort, setting
+    from params import structured_format, validate_oneoff
 
-logger = logging.getLogger("claude_agent_session")
-DIRECTSDK = "claude-subscription-directsdk-experimental"
 SETTINGS = ("max_live_processes", "idle_seconds", "parked_idle_seconds", "step_timeout_seconds")
 _HOST: SessionHost | None = None
 _HOST_LOCK = threading.Lock()
@@ -37,37 +36,6 @@ def host() -> SessionHost:
         if _HOST is None:
             _HOST = SessionHost()
         return _HOST
-
-
-# -- DirectSDK catalog (model aliases, context windows) loaded by path, never as a package import --
-def _directsdk_dir() -> Path | None:
-    candidates = []
-    if os.environ.get("CLAUDE_AGENT_SESSION_DIRECTSDK_DIR"):
-        candidates.append(Path(os.environ["CLAUDE_AGENT_SESSION_DIRECTSDK_DIR"]))
-    home = os.environ.get("HERMES_HOME")
-    if home:
-        candidates.append(Path(home) / "plugins" / DIRECTSDK)
-    candidates.append(Path.home() / ".hermes" / "plugins" / DIRECTSDK)
-    return next((c for c in candidates if (c / "model_catalog.py").is_file()), None)
-
-
-def load_catalog() -> Any:
-    found = _directsdk_dir()
-    if found is not None:
-        spec = importlib.util.spec_from_file_location("claude_agent_session_catalog", found / "model_catalog.py")
-        if spec and spec.loader:
-            module = importlib.util.module_from_spec(spec)
-            try:
-                spec.loader.exec_module(module)
-                return module
-            except Exception:
-                logger.warning("claude-agent-session: could not load DirectSDK model catalog", exc_info=True)
-    return SimpleNamespace(ALIASES={"opus": "claude-opus-5-5", "sonnet": "claude-sonnet-5-5", "haiku": "claude-haiku-5-5"},
-                           MODEL_METADATA={}, MODEL_CAPABILITIES={}, native_model=lambda m: m,
-                           accepts_thinking_disable=lambda m: False)
-
-
-CATALOG = load_catalog()
 
 
 def _hermes_home() -> str:
@@ -90,8 +58,8 @@ def _system_text(messages: list[dict]) -> str:
     return "\n\n".join(p for p in parts if p)
 
 
-def wants_directsdk(kwargs: dict) -> bool:
-    """Calls that aren't one Hermes session's main loop stay stateless on DirectSDK."""
+def wants_oneoff(kwargs: dict) -> bool:
+    """Keep auxiliary work separate from persistent conversation state."""
     if kwargs.get("hermes_auxiliary") is True or not kwargs.get("hermes_session_id"):
         return True
     messages = kwargs.get("messages") or []
@@ -103,13 +71,17 @@ def wants_directsdk(kwargs: dict) -> bool:
             MAX_ITERATIONS_SUMMARY_REQUEST = None
         if MAX_ITERATIONS_SUMMARY_REQUEST is not None and messages[-1].get("content") == MAX_ITERATIONS_SUMMARY_REQUEST:
             return True
-    response_format = kwargs.get("response_format") or (kwargs.get("extra_body") or {}).get("response_format")
+    extra = kwargs.get("extra_body") or {}
+    if not isinstance(extra, dict):
+        return True
+    response_format = kwargs.get("response_format") or extra.get("response_format")
     if isinstance(response_format, dict) and response_format.get("type") not in (None, "text"):
         return True
-    return kwargs.get("n", 1) != 1 or kwargs.get("tool_choice", "auto") not in ("auto", None)
+    return (kwargs.get("n", 1) != 1 or kwargs.get("tool_choice", "auto") not in ("auto", None)
+            or kwargs.get("parallel_tool_calls") is False)
 
 
-def build_request(kwargs: dict) -> SessionRequest:
+def build_request(kwargs: dict, *, one_shot: bool = False) -> SessionRequest:
     model = kwargs.get("model")
     if not isinstance(model, str) or not model:
         raise ValueError("model is required")
@@ -128,12 +100,20 @@ def build_request(kwargs: dict) -> SessionRequest:
     max_tokens = kwargs.get("max_tokens") or kwargs.get("max_completion_tokens") or extra.get("max_tokens")
     max_tokens = max_tokens if isinstance(max_tokens, int) and max_tokens > 0 else None
     messages = list(kwargs.get("messages") or [])
+    response_format = kwargs.get("response_format") or extra.get("response_format") or {}
+    timeout = kwargs.get("timeout", 900)
+    if timeout is not None and not isinstance(timeout, (int, float)):
+        timeout = getattr(timeout, "read", 900)
     return SessionRequest(
-        home=_hermes_home(), session_id=str(kwargs["hermes_session_id"]), model=native, effort=effort,
+        home=_hermes_home(), session_id=str(uuid.uuid4()) if one_shot else str(kwargs["hermes_session_id"]),
+        model=native, effort=effort,
         thinking_disabled=thinking_disabled, system=_system_text(messages), messages=messages,
         tools=list(kwargs.get("tools") or []), max_output_tokens=max_tokens,
         env=child_env(max_output_tokens=max_tokens),
-        settings={k: v for k in SETTINGS if (v := setting(k)) is not None})
+        settings={k: v for k in SETTINGS if (v := setting(k)) is not None},
+        one_shot=one_shot, output_format=structured_format(kwargs) if one_shot else None,
+        json_mode=one_shot and response_format.get("type") == "json_object",
+        timeout=timeout if one_shot else None)
 
 
 class Obj(SimpleNamespace):
@@ -176,8 +156,14 @@ class TurnStream:
             delta = {"content": text} if kind == "text" else {"reasoning_content": text}
             self._queue.put(chunk(model, delta))
 
+        def complete(_future) -> None:
+            key = (req.home, req.session_id)
+            client._active.discard(key)
+            client._one_shots.discard(key)
+            self._queue.put(_DONE)
+
         self._future = host().submit(host().run(req, emit))
-        self._future.add_done_callback(lambda _f: self._queue.put(_DONE))
+        self._future.add_done_callback(complete)
 
     def __iter__(self) -> TurnStream:
         return self
@@ -189,7 +175,6 @@ class TurnStream:
         if item is not _DONE:
             return item
         self._finished = True
-        self._client._active.discard((self._req.home, self._req.session_id))
         outcome = self._future.result()  # re-raises the step's error
         end, message = outcome.end, outcome.message
         finish = {"tool_calls": "tool_calls", "length": "length"}.get(end.kind, "stop")
@@ -243,11 +228,11 @@ class AsyncTurnStream:
 
 
 class Client:
-    def __init__(self, **_: Any) -> None:
+    def __init__(self, **client_kwargs: Any) -> None:
+        self._default_timeout = client_kwargs.get("timeout", 900)
         self.chat = SimpleNamespace(completions=SimpleNamespace(create=self.create))
         self._active: set[tuple[str, str]] = set()
-        self._aux: Any = None
-        self._lock = threading.Lock()
+        self._one_shots: set[tuple[str, str]] = set()
 
     def create(self, **kwargs: Any) -> Any:
         try:
@@ -264,41 +249,23 @@ class Client:
         return AsyncTurnStream(result) if isinstance(result, TurnStream) else result
 
     def _create(self, **kwargs: Any) -> Any:
-        if wants_directsdk(kwargs):
-            return self._directsdk().chat.completions.create(
-                **{k: v for k, v in kwargs.items() if k != "hermes_session_id"})
-        req = build_request(kwargs)
-        self._active.add((req.home, req.session_id))
+        one_shot = wants_oneoff(kwargs)
+        if one_shot:
+            kwargs.setdefault("timeout", self._default_timeout)
+            validate_oneoff(kwargs)
+        req = build_request(kwargs, one_shot=one_shot)
+        key = (req.home, req.session_id)
+        self._active.add(key)
+        if one_shot:
+            self._one_shots.add(key)
         stream = TurnStream(self, req, kwargs["model"])
         return stream if kwargs.get("stream") else stream.collect()
-
-    def _directsdk(self) -> Any:
-        with self._lock:
-            if self._aux is None:
-                try:
-                    from providers import get_provider_profile
-                    profile = get_provider_profile(DIRECTSDK)
-                except Exception:  # noqa: BLE001
-                    profile = None
-                client = profile.create_client() if profile is not None else None
-                if client is None:
-                    raise errors.ClaudeAPIError(
-                        "claude-agent-session sends auxiliary calls through the "
-                        f"{DIRECTSDK} plugin, which isn't installed", 400)
-                self._aux = client
-            return self._aux
 
     def cancel(self) -> None:
         for home, session_id in list(self._active):
             host().interrupt(home, session_id)
-        if self._aux is not None and callable(getattr(self._aux, "cancel", None)):
-            self._aux.cancel()
 
     def close(self) -> None:
-        """Hermes recycles clients freely; live sessions belong to the host, not to this object."""
-        if self._aux is not None:
-            try:
-                self._aux.close()
-            except Exception:
-                logger.debug("claude-agent-session: closing the DirectSDK client failed", exc_info=True)
-            self._aux = None
+        """Cancel owned disposable calls; persistent sessions remain owned by the host."""
+        for home, session_id in list(self._one_shots):
+            host().interrupt(home, session_id)

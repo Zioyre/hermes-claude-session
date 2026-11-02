@@ -1,3 +1,5 @@
+from types import SimpleNamespace
+
 import pytest
 from helpers import fake_log, open_live
 
@@ -22,3 +24,17 @@ async def test_entrypoint_reaches_sdk_child(tmp_path, monkeypatch, inherited):
         assert starts[0]["entrypoint"] == "glibglorper"
     finally:
         await live.close()
+
+
+@pytest.mark.parametrize("model,disabled,expected", [
+    ("sonnet", False, {"type": "adaptive", "display": "summarized"}),
+    ("haiku-4-5", False, None),
+    ("claude-haiku-4-5-20251001", False, None),
+    ("haiku-4-5", True, {"type": "disabled"}),
+])
+def test_older_models_keep_native_thinking_default(tmp_path, model, disabled, expected):
+    sdk = SimpleNamespace(ClaudeAgentOptions=lambda **kwargs: SimpleNamespace(**kwargs))
+    built = options.build_options(sdk=sdk, cli_path="claude", cwd=tmp_path, model=model, effort=None,
+                                  thinking_disabled=disabled, system_prompt_file=tmp_path / "system.md",
+                                  mcp_server=None, hooks={}, env={})
+    assert built.thinking == expected
