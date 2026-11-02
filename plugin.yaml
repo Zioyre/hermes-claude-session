@@ -1,0 +1,44 @@
+name: claude-agent-session-experimental
+kind: model-provider
+version: 0.1.0
+manifest_version: 2
+description: Persistent Claude Code sessions through the Agent SDK, with Hermes-owned tools and compaction.
+author: hermes-claude-session contributors
+homepage: https://github.com/Zioyre/hermes-claude-session
+license: MIT
+tags: [model-provider, anthropic, claude, subscription, experimental]
+requires_hermes: ">=0.21.4"
+platforms: [linux, macos]
+optional_env:
+  - CLAUDE_AGENT_SESSION_COMMAND
+  - CLAUDE_AGENT_SESSION_DIRECTSDK_DIR
+external_dependencies:
+  - name: claude
+    check: "claude --version"
+    install: "npm install -g @anthropic-ai/claude-code"
+config_schema:
+  max_live_processes:
+    type: int
+    default: 2
+    label: Live Claude Code processes
+    description: Maximum native session processes per Hermes process.
+  idle_seconds:
+    type: int
+    default: 300
+    label: Idle stop after a finished turn (seconds)
+  parked_idle_seconds:
+    type: int
+    default: 1800
+    label: Idle stop while waiting on tool results (seconds)
+  step_timeout_seconds:
+    type: int
+    default: 900
+    label: Max wait for one model step (seconds)
+  claude_config_dir:
+    type: string
+    default: ""
+    label: Claude login config directory
+  claude_code_telemetry:
+    type: bool
+    default: true
+    label: Claude Code telemetry and feature flags
